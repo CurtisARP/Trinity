@@ -1,43 +1,45 @@
 #!/usr/bin/env python3
 """
-Run a single pipeline for testing.
+Run a single pipeline for testing using the same classes as production.
 Usage: python run_pipeline.py <pipeline_name>
 Example: python run_pipeline.py redgifs_ai_generated_to_telegram
 """
 
-import sys
-import json
 import importlib
+import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent / "src"))
+from dotenv import load_dotenv
+
+load_dotenv()
+
+APP_DIR = Path(__file__).parent
+sys.path.insert(0, str(APP_DIR))
+sys.path.insert(0, str(APP_DIR / "src"))
+
+_imghdr_path = APP_DIR / "src" / "imghdr.py"
+if _imghdr_path.exists():
+    from importlib.util import module_from_spec, spec_from_file_location
+
+    spec = spec_from_file_location("imghdr", str(_imghdr_path))
+    _imghdr = module_from_spec(spec)
+    spec.loader.exec_module(_imghdr)
+    sys.modules["imghdr"] = _imghdr
 
 from src.config import load_pipeline_config
+from src.pipeline_store import MyPipelineStore
 
 
-class TestPipeline:
-    """Minimal pipeline mock for testing."""
-
-    def __init__(self, name: str, log_dir: Path, history_dir: Path):
-        self.name = name
-        self.log_dir = log_dir
-        self.history_dir = history_dir
-        self.media = []
-
-    def check_post_history(self, filename: str):
-        return False
-
-    def add_media(self, media_type: str, path: str):
-        self.media.append({"type": media_type, "path": path})
-        print(f"  Added media: {media_type} - {path}")
-
-    def log(self, message: str):
-        print(f"  [LOG] {message}")
+def load_function(full_function_path: str):
+    """Dynamically loads a function given its full path."""
+    module_path, function_name = full_function_path.rsplit(".", 1)
+    module = importlib.import_module(module_path)
+    return getattr(module, function_name)
 
 
 def run_single_pipeline(pipeline_name: str):
-    """Run a single pipeline by name."""
-    pipelines_dir = Path(__file__).parent / "pipelines"
+    """Run a single pipeline by name using production classes."""
+    pipelines_dir = APP_DIR / "pipelines"
     pipeline_file = pipelines_dir / f"{pipeline_name}.json"
 
     if not pipeline_file.exists():
@@ -51,60 +53,51 @@ def run_single_pipeline(pipeline_name: str):
     print(f"Loading pipeline: {pipeline_name}")
     config = load_pipeline_config(pipeline_file)
 
-    log_dir = Path(__file__).parent / "logs"
-    history_dir = Path(__file__).parent / "history"
-    pipeline = TestPipeline(config.get("name", pipeline_name), log_dir, history_dir)
+    # Load notification config from global.json
+    global_config_file = pipelines_dir / "global.json"
+    notification_config = {}
+    if global_config_file.exists():
+        global_config = load_pipeline_config(global_config_file)
+        notification_config = global_config.get("notifications", {})
 
-    print(f"\nRunning pipeline: {pipeline.name}")
+    name = config.get("name", "unnamed")
+    print(f"\nRunning pipeline: {name}")
     print("=" * 50)
 
-    try:
-        source_config = config.get("source", {})
-        source_task = source_config.get("task", "")
+    config.setdefault("instant_launch", False)
+    config.setdefault("launch_condition", {"time": "*/15 * * * *"})
 
+    # Load tasks (same as runner.py)
+    tasks = []
+    try:
+        source_task = config.get("source", {}).get("task", "")
         if not source_task:
             print("Error: No source task defined in pipeline")
             sys.exit(1)
 
-        print("\n[1] Running source...")
-        print(f"  Task: {source_task}")
+        tasks = [load_function(source_task)]
+        tasks += [load_function(m) for m in config.get("middleware", []) if m]
+        tasks.append(load_function(config.get("post", {}).get("task", "")))
+    except Exception as e:
+        print(f"Error loading tasks: {e}")
+        sys.exit(1)
 
-        module_path, func_name = source_task.rsplit(".", 1)
-        module = importlib.import_module(module_path)
-        source_func = getattr(module, func_name)
+    # Create pipeline store (same as runner.py)
+    store = MyPipelineStore(notification_config=notification_config)
 
-        result = source_func(pipeline, config)
+    try:
+        store.add_pipeline(config, tasks)
+    except Exception as e:
+        print(f"Error adding pipeline: {e}")
+        sys.exit(1)
 
-        middlewares = config.get("middleware", [])
-        for i, mw_path in enumerate(middlewares, 2):
-            if not mw_path:
-                continue
-            print(f"\n[{i}] Running middleware...")
-            print(f"  Task: {mw_path}")
-
-            mw_module_path, mw_func_name = mw_path.rsplit(".", 1)
-            mw_module = importlib.import_module(mw_module_path)
-            mw_func = getattr(mw_module, mw_func_name)
-            result = mw_func(pipeline, result)
-
-        post_config = config.get("post", {})
-        post_task = post_config.get("task", "")
-
-        if post_task:
-            print(f"\n[{len(middlewares) + 2}] Running poster...")
-            print(f"  Task: {post_task}")
-
-            post_module_path, post_func_name = post_task.rsplit(".", 1)
-            post_module = importlib.import_module(post_module_path)
-            post_func = getattr(post_module, post_func_name)
-            result = post_func(pipeline, result)
-
+    try:
+        pipeline = list(store.get_all_pipelines().values())[0]
+        pipeline.execute_pipeline(tasks, config)
         print("\n" + "=" * 50)
         print("Pipeline completed successfully!")
-        print(f"  Media files: {len(pipeline.media)}")
-
     except Exception as e:
-        print("\n" + "=" * 50)
+        print(f"\n" + "=" * 50)
         print(f"Pipeline failed: {e}")
         import traceback
 
